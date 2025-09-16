@@ -56,8 +56,22 @@ def generate_synthetic_data(n_samples=5000, n_features=25, scenario='education',
         scores[:, 1] = 1.0 * X[:, 0] - 0.5 * X[:, 1] - 0.5 * (1 - X[:, 2])
         scores[:, 2] = 2.0 * X[:, 0] - 1.0 * X[:, 1] - 1.0 * (1 - X[:, 2])
         scores[:, 3] = 2.5 * X[:, 0] - 2.0 * X[:, 1] - 2.0 * (1 - X[:, 2])
+    elif scenario == 'fertilizer':
+        # Ordered, monotonic treatments: T0=0kg, T1=15kg, T2=30kg, T3=45kg
+        # Covariates: X1=Soil Quality, X2=Sunlight
+        doses = np.array([0, 15, 30, 45])
+        
+        for t in range(4):
+            # Logarithmic dose-response, interacting with soil quality and sunlight
+            Y_potential[:, t] = (10 + 5 * sigmoid(X[:, 0])) * np.log(doses[t] + 1) + 2 * sigmoid(X[:, 1]) + 5 + epsilon
+
+        # Treatment assignment scores (confounding based on soil quality)
+        scores[:, 0] = 0 # Baseline for no fertilizer
+        scores[:, 1] = 1.0 * X[:, 0]
+        scores[:, 2] = 2.0 * X[:, 0]
+        scores[:, 3] = 3.0 * X[:, 0]
     else:
-        raise ValueError("Scenario must be 'education' or 'medication'.")
+        raise ValueError("Scenario must be 'education', 'medication', or 'fertilizer'.")
 
     scores_kappa = scores * kappa
     propensity_scores = np.exp(scores_kappa - np.max(scores_kappa, axis=1, keepdims=True))
@@ -120,52 +134,62 @@ def make_structured_mcfr_net(input_dim, num_treatments, reg_l2):
 def make_hierarchical_mcfr_net(input_dim, num_treatments, reg_l2, scenario):
     x_input = Input(shape=(input_dim,), name='x_input')
 
+    # --- ADJUSTMENT: These sizes were chosen to make params comparable ---
     phi_0 = Dense(units=256, activation='elu', kernel_initializer='RandomNormal', name='phi_0_1')(x_input)
     phi_0 = Dense(units=256, activation='elu', kernel_initializer='RandomNormal', name='phi_0_2')(phi_0)
 
     y_preds = [None] * num_treatments
 
-    if scenario == 'medication':
-        phi_1 = Dense(units=256, activation='elu', kernel_initializer='RandomNormal', name='phi_1')(phi_0)
-        phi_2 = Dense(units=128, activation='elu', kernel_initializer='RandomNormal', name='phi_2')(phi_1)
-        phi_3 = Dense(units=64, activation='elu', kernel_initializer='RandomNormal', name='phi_3')(phi_2)
+    # --- THE FIX: ADDED 'fertilizer' to this condition ---
+    if scenario in ['medication', 'fertilizer', 'education']:
+        # --- Chained Hierarchy for Ordered Treatments ---
+        phi_1 = Dense(units=128, activation='elu', kernel_initializer='RandomNormal', name='phi_1')(phi_0)
+        phi_2 = Dense(units=64, activation='elu', kernel_initializer='RandomNormal', name='phi_2')(phi_1)
 
-        # Make the final prediction heads larger as well
-        h0_out = Dense(units=32, activation='elu', name='h0_hidden')(phi_0)
-        h0_out = Dense(units=1, name='y0_pred')(h0_out)
+        # Hypothesis heads connect to their deepest relevant representation
+        h0_hidden = Dense(units=32, activation='elu', name='h0_hidden')(phi_0)
+        h0_out = Dense(units=1, name='y0_pred')(h0_hidden)
 
-        h1_out = Dense(units=32, activation='elu', name='h1_hidden')(phi_1)
-        h1_out = Dense(units=1, name='y1_pred')(h1_out)
+        h1_hidden = Dense(units=32, activation='elu', name='h1_hidden')(phi_1)
+        h1_out = Dense(units=1, name='y1_pred')(h1_hidden)
 
-        h2_out = Dense(units=32, activation='elu', name='h2_hidden')(phi_2)
-        h2_out = Dense(units=1, name='y2_pred')(h2_out)
+        h2_hidden = Dense(units=32, activation='elu', name='h2_hidden')(phi_2)
+        h2_out = Dense(units=1, name='y2_pred')(h2_hidden)
         
-        # For the max dose, one can think about connecting it to phi_2 for stability. Maybe next time
-        h3_out = Dense(units=1, name='y3_pred')(phi_3) 
+        # Head for T3 connects to the last specialized layer, phi_2
+        h3_hidden = Dense(units=32, activation='elu', name='h3_hidden')(phi_2)
+        h3_out = Dense(units=1, name='y3_pred')(h3_hidden)
 
         y_preds = [h0_out, h1_out, h2_out, h3_out]
 
-    elif scenario == 'education':
-        phi_A = Dense(units=200, activation='elu', kernel_initializer='RandomNormal', name='phi_A')(phi_0)
-        phi_B = Dense(units=200, activation='elu', kernel_initializer='RandomNormal', name='phi_B')(phi_0)
+    # elif scenario == 'education':
+    #     # --- Branched Hierarchy for Unordered Treatments ---
+    #     phi_A = Dense(units=128, activation='elu', kernel_initializer='RandomNormal', name='phi_A')(phi_0)
+    #     phi_B = Dense(units=128, activation='elu', kernel_initializer='RandomNormal', name='phi_B')(phi_0)
 
-        # Make the final prediction heads larger
-        hA_hidden = Dense(units=64, activation='elu', name='hA_hidden')
-        hB_hidden = Dense(units=64, activation='elu', name='hB_hidden')
+    #     # Re-usable hidden layers for each branch
+    #     hA_hidden_layer = Dense(units=64, activation='elu', name='hA_hidden')
+    #     hB_hidden_layer = Dense(units=64, activation='elu', name='hB_hidden')
         
-        y0_hidden = hA_hidden(phi_A)
-        y2_hidden = hA_hidden(phi_A)
-        
-        y1_hidden = hB_hidden(phi_B)
-        y3_hidden = hB_hidden(phi_B)
+    #     # Define final prediction layers
+    #     y0_pred_layer = Dense(units=1, name='y0_pred')
+    #     y1_pred_layer = Dense(units=1, name='y1_pred')
+    #     y2_pred_layer = Dense(units=1, name='y2_pred')
+    #     y3_pred_layer = Dense(units=1, name='y3_pred')
 
-        y_preds[0] = Dense(units=1, name='y0_pred')(y0_hidden)
-        y_preds[2] = Dense(units=1, name='y2_pred')(y2_hidden)
-        y_preds[1] = Dense(units=1, name='y1_pred')(y1_hidden)
-        y_preds[3] = Dense(units=1, name='y3_pred')(y3_hidden)
+    #     # Connect the layers
+    #     y_preds[0] = y0_pred_layer(hA_hidden_layer(phi_A))
+    #     y_preds[2] = y2_pred_layer(hA_hidden_layer(phi_A))
+        
+    #     y_preds[1] = y1_pred_layer(hB_hidden_layer(phi_B))
+    #     y_preds[3] = y3_pred_layer(hB_hidden_layer(phi_B))
+
+    else:
+        raise ValueError("Scenario not recognized in hierarchical model builder.")
 
     concat_y_preds = Concatenate(axis=1, name='concat_predictions')(y_preds)
     model_output = Concatenate(axis=1, name='final_output_with_phi_0')([concat_y_preds, phi_0])
+    
     model = Model(inputs=x_input, outputs=model_output)
     return model
 
@@ -415,7 +439,7 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run Causal Inference Model Experiments")
-    parser.add_argument('--scenario', type=str, default='education', choices=['education', 'medication'])
+    parser.add_argument('--scenario', type=str, default='education', choices=['education', 'medication', 'fertilizer'], help='Simulation scenario')
     parser.add_argument('--model_type', type=str, default='mcfrnet', 
                         choices=['mcfrnet', 'structured_mcfr', 'hierarchical_mcfr', 'causal_forest'])
     parser.add_argument('--output_dir', type=str, required=True, help='Directory to save results.')
@@ -424,8 +448,8 @@ if __name__ == '__main__':
     parser.add_argument('--kappa', type=float, default=2.0)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--learning_rate', type=float, default=1e-3)
+    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--l2_reg', type=float, default=1e-3)
     parser.add_argument('--alpha_ipm', type=float, default=1.0)
     

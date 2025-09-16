@@ -1,11 +1,12 @@
 #!/bin/bash
 
 # --- Experiment Configuration ---
-SCENARIOS=("education" "medication")
-MODELS=("mcfrnet" "hierarchical_mcfr" "causal_forest")
-NSAMPLES=(2000 5000)
+SCENARIOS=("education")
+MODELS=("hierarchical_mcfr" "mcfrnet" "causal_forest" "structured_mcfr")
+NSAMPLES=(1000)
 KAPPAS=(0.5 2.0 5.0)
-SEEDS=$(seq 10 13)
+SEEDS=(70)
+#$(seq 100 108)
 
 # --- NEW: Create a timestamped parent directory for this entire run ---
 TIMESTAMP=$(date +'%Y-%m-%d_%H-%M-%S')
