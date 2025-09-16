@@ -12,6 +12,9 @@ from tensorflow.keras.losses import Loss
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, TerminateOnNaN
 
+from econml.dml import CausalForestDML
+from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
+
 # Silence TensorFlow warnings
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -73,6 +76,7 @@ from tensorflow.keras.layers import Input, Dense, Concatenate
 from tensorflow.keras import regularizers, Model
 from tensorflow.keras.losses import Loss
 
+# --- Model 1: Baseline MCFRNet (Independent Heads) ---
 def make_mcfr_net(input_dim, num_treatments, reg_l2):
     x = Input(shape=(input_dim,), name='input')
     phi = Dense(units=200, activation='elu', kernel_initializer='RandomNormal', name='phi_1')(x)
@@ -83,7 +87,7 @@ def make_mcfr_net(input_dim, num_treatments, reg_l2):
     for i in range(num_treatments):
         head_name = f'y{i}'
         hidden = Dense(units=100, activation='elu', kernel_regularizer=regularizers.l2(reg_l2), name=f'{head_name}_hidden_1')(phi)
-        hidden = Dense(units=100, activation='elu', kernel_regularizer=regularizers.l2(reg_l2), name=f'{head_name}_hidden_2')(hidden) # Added second hidden layer
+        hidden = Dense(units=100, activation='elu', kernel_regularizer=regularizers.l2(reg_l2), name=f'{head_name}_hidden_2')(hidden)
         predictions = Dense(units=1, activation=None, kernel_regularizer=regularizers.l2(reg_l2), name=f'{head_name}_predictions')(hidden)
         output_heads.append(predictions)
 
@@ -92,85 +96,76 @@ def make_mcfr_net(input_dim, num_treatments, reg_l2):
     model = Model(inputs=x, outputs=model_output)
     return model
 
+# --- Model 2: Structured-MCFRNet (Shared Head) ---
 def make_structured_mcfr_net(input_dim, num_treatments, reg_l2):
-    """
-    Creates a Structured Multi-head Counterfactual Regression Network.
-    This version uses a single, shared hypothesis head.
-    """
-    # Define two input layers
     x_input = Input(shape=(input_dim,), name='x_input')
-    t_input = Input(shape=(1,), name='t_input') # The treatment is now an input
-
-    # SHARED REPRESENTATION LAYERS (Φ) - Identical to the baseline
+    t_input = Input(shape=(1,), name='t_input') 
+    
     phi = Dense(units=200, activation='elu', kernel_initializer='RandomNormal', name='phi_1')(x_input)
     phi = Dense(units=200, activation='elu', kernel_initializer='RandomNormal', name='phi_2')(phi)
     phi = Dense(units=200, activation='elu', kernel_initializer='RandomNormal', name='phi_3')(phi)
 
-    # Combine the representation and the treatment input
     concatenated_input = Concatenate(axis=1)([phi, t_input])
 
-    # SINGLE SHARED HYPOTHESIS NETWORK (h)
-    hidden = Dense(units=200, activation='elu', kernel_regularizer=regularizers.l2(reg_l2), name='h_hidden_1')(concatenated_input)
-    hidden = Dense(units=100, activation='elu', kernel_regularizer=regularizers.l2(reg_l2), name='h_hidden_2')(hidden)
+    hidden = Dense(units=256, activation='elu', kernel_regularizer=regularizers.l2(reg_l2), name='h_hidden_1')(concatenated_input)
+    hidden = Dense(units=256, activation='elu', kernel_regularizer=regularizers.l2(reg_l2), name='h_hidden_2')(hidden)
     y_pred = Dense(units=1, activation=None, kernel_regularizer=regularizers.l2(reg_l2), name='y_predictions')(hidden)
 
-    # The final model output must include phi for the IPM loss calculation
     model_output = Concatenate(axis=1, name='final_output_with_phi')([y_pred, phi])
-
-    # The model now has two inputs
+    
     model = Model(inputs=[x_input, t_input], outputs=model_output)
     return model
 
+# --- Model 3: Hierarchical-MCFRNet (Partially Shared) ---
 def make_hierarchical_mcfr_net(input_dim, num_treatments, reg_l2, scenario):
-    """
-    Creates a Hierarchical Multi-head Counterfactual Regression Network.
-    Architecture is different depending on the scenario (ordered vs. unordered).
-    """
     x_input = Input(shape=(input_dim,), name='x_input')
 
-    # --- Base Representation (Shared by ALL treatments) ---
-    phi_0 = Dense(units=200, activation='elu', kernel_initializer='RandomNormal', name='phi_0')(x_input)
-    phi_0 = Dense(units=100, activation='elu', kernel_initializer='RandomNormal', name='phi_0_2')(phi_0)
+    phi_0 = Dense(units=256, activation='elu', kernel_initializer='RandomNormal', name='phi_0_1')(x_input)
+    phi_0 = Dense(units=256, activation='elu', kernel_initializer='RandomNormal', name='phi_0_2')(phi_0)
 
     y_preds = [None] * num_treatments
 
     if scenario == 'medication':
-        # --- Chained Hierarchy for Ordered Treatments ---
-        # Level 1: Active Dose Representation (shared by T=1, 2, 3)
-        phi_1 = Dense(units=50, activation='elu', kernel_initializer='RandomNormal', name='phi_1')(phi_0)
+        phi_1 = Dense(units=256, activation='elu', kernel_initializer='RandomNormal', name='phi_1')(phi_0)
+        phi_2 = Dense(units=128, activation='elu', kernel_initializer='RandomNormal', name='phi_2')(phi_1)
+        phi_3 = Dense(units=64, activation='elu', kernel_initializer='RandomNormal', name='phi_3')(phi_2)
+
+        # Make the final prediction heads larger as well
+        h0_out = Dense(units=32, activation='elu', name='h0_hidden')(phi_0)
+        h0_out = Dense(units=1, name='y0_pred')(h0_out)
+
+        h1_out = Dense(units=32, activation='elu', name='h1_hidden')(phi_1)
+        h1_out = Dense(units=1, name='y1_pred')(h1_out)
+
+        h2_out = Dense(units=32, activation='elu', name='h2_hidden')(phi_2)
+        h2_out = Dense(units=1, name='y2_pred')(h2_out)
         
-        # Level 2: High Dose Representation (shared by T=2, 3)
-        phi_2 = Dense(units=25, activation='elu', kernel_initializer='RandomNormal', name='phi_2')(phi_1)
+        # For the max dose, one can think about connecting it to phi_2 for stability. Maybe next time
+        h3_out = Dense(units=1, name='y3_pred')(phi_3) 
 
-        # Level 3: Max Dose Representation (only for T=3)
-        phi_3 = Dense(units=10, activation='elu', kernel_initializer='RandomNormal', name='phi_3')(phi_2)
-
-        # Hypothesis heads connect to their deepest relevant representation
-        h0_out = Dense(units=1, name='y0_pred')(phi_0)
-        h1_out = Dense(units=1, name='y1_pred')(phi_1)
-        h2_out = Dense(units=1, name='y2_pred')(phi_2)
-        h3_out = Dense(units=1, name='y3_pred')(phi_3)
         y_preds = [h0_out, h1_out, h2_out, h3_out]
 
     elif scenario == 'education':
-        # --- Branched Hierarchy for Unordered Treatments ---
-        # Group A: "Individual Learning" (T=0, T=2)
-        phi_A = Dense(units=50, activation='elu', kernel_initializer='RandomNormal', name='phi_A')(phi_0)
-        
-        # Group B: "Social Learning" (T=1, T=3)
-        phi_B = Dense(units=50, activation='elu', kernel_initializer='RandomNormal', name='phi_B')(phi_0)
+        phi_A = Dense(units=200, activation='elu', kernel_initializer='RandomNormal', name='phi_A')(phi_0)
+        phi_B = Dense(units=200, activation='elu', kernel_initializer='RandomNormal', name='phi_B')(phi_0)
 
-        # Hypothesis heads connect to their group's representation
-        y_preds[0] = Dense(units=1, name='y0_pred')(phi_A) # T0 (Videos) -> Individual
-        y_preds[2] = Dense(units=1, name='y2_pred')(phi_A) # T2 (Gamified) -> Individual
+        # Make the final prediction heads larger
+        hA_hidden = Dense(units=64, activation='elu', name='hA_hidden')
+        hB_hidden = Dense(units=64, activation='elu', name='hB_hidden')
         
-        y_preds[1] = Dense(units=1, name='y1_pred')(phi_B) # T1 (Projects) -> Social
-        y_preds[3] = Dense(units=1, name='y3_pred')(phi_B) # T3 (Mentorship) -> Social
+        y0_hidden = hA_hidden(phi_A)
+        y2_hidden = hA_hidden(phi_A)
+        
+        y1_hidden = hB_hidden(phi_B)
+        y3_hidden = hB_hidden(phi_B)
 
-    # Concatenate all head outputs and the base representation for the loss function
+        y_preds[0] = Dense(units=1, name='y0_pred')(y0_hidden)
+        y_preds[2] = Dense(units=1, name='y2_pred')(y2_hidden)
+        y_preds[1] = Dense(units=1, name='y1_pred')(y1_hidden)
+        y_preds[3] = Dense(units=1, name='y3_pred')(y3_hidden)
+
     concat_y_preds = Concatenate(axis=1, name='concat_predictions')(y_preds)
     model_output = Concatenate(axis=1, name='final_output_with_phi_0')([concat_y_preds, phi_0])
-
     model = Model(inputs=x_input, outputs=model_output)
     return model
 
@@ -258,15 +253,18 @@ class MCFRNet_Loss(tf.keras.losses.Loss):
 # =============================================================================
 
 def evaluate_model(model, X_test, Y_potential_test, y_scaler, num_treatments, model_type):
-    """Calculates the PEHE for a trained model."""
+    """Calculates the PEHE and returns CATEs for a trained model."""
     
+    # --- This part is new: Initialize est_cate for the return statement ---
+    est_cate = None
+
     if model_type in ['mcfrnet', 'hierarchical_mcfr']:
-        # These models predict all K outcomes at once
         model_preds = model.predict(X_test)
         y_preds_scaled = model_preds[:, :num_treatments]
+        y_preds = y_scaler.inverse_transform(y_preds_scaled)
+        est_cate = y_preds[:, 1:] - y_preds[:, [0]]
     
     elif model_type == 'structured_mcfr':
-        # This model requires K separate predictions
         y_preds_scaled_list = []
         for t in range(num_treatments):
             t_input = np.full((X_test.shape[0], 1), t, dtype=np.float32)
@@ -274,14 +272,27 @@ def evaluate_model(model, X_test, Y_potential_test, y_scaler, num_treatments, mo
             y_pred_t = model_preds[:, 0]
             y_preds_scaled_list.append(y_pred_t)
         y_preds_scaled = np.stack(y_preds_scaled_list, axis=1)
+        y_preds = y_scaler.inverse_transform(y_preds_scaled)
+        est_cate = y_preds[:, 1:] - y_preds[:, [0]]
+        
+    elif model_type == 'causal_forest':
+        # Causal Forest's .effect() directly gives the CATE.
+        est_cate = np.stack([model.effect(X_test, T0=0, T1=t) for t in range(1, num_treatments)], axis=1)
+        
     else:
         raise ValueError(f"Evaluation logic for {model_type} not defined.")
 
-    y_preds = y_scaler.inverse_transform(y_preds_scaled)
+    # Now calculate PEHE using the consistent est_cate variable
     true_cate = Y_potential_test[:, 1:] - Y_potential_test[:, [0]]
-    est_cate = y_preds[:, 1:] - y_preds[:, [0]]
     pehe = np.sqrt(np.mean(np.square(true_cate - est_cate), axis=0))
-    return pehe
+    
+    # --- THE FIX ---
+    # Ensure all branches return a dictionary with the same keys.
+    return {
+        'pehe': pehe,
+        'est_cate': est_cate,
+        'true_cate': true_cate
+    }
 
 # =============================================================================
 # SECTION 4: MAIN EXECUTION SCRIPT
@@ -368,22 +379,47 @@ def main(args):
             validation_split=0.2, epochs=args.epochs,
             batch_size=args.batch_size, callbacks=callbacks, verbose=1)
             
-    else:
-        raise ValueError(f"Model type '{args.model_type}' not recognized.")
-
+    elif args.model_type == 'causal_forest':
+            try:
+                model_t = GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=args.seed)
+                model_y = GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=args.seed)
+                
+                model = CausalForestDML(model_y=model_y,
+                                        model_t=model_t,
+                                        discrete_treatment=True,
+                                        random_state=args.seed)
+                
+                # EconML requires T to be a 1D array for classification
+                model.fit(Y=Y_factual_train, T=T_train.ravel(), X=X_train)
+            except Exception as e:
+                print(f"Causal Forest failed to train for this run. Error: {e}")
+                # Exit gracefully so the bash script can continue with the next run
+                return 
+            
     # 5. Evaluate Model
-    pehe_results = evaluate_model(model, X_test, Y_potential_test, y_scaler, num_treatments, args.model_type)
+    eval_results = evaluate_model(model, X_test, Y_potential_test, y_scaler, num_treatments, args.model_type)
+    
+    pehe_results = eval_results['pehe']
     print("\n--- Evaluation Results ---")
     print(f"PEHE (T1 vs T0): {pehe_results[0]:.4f}")
     print(f"PEHE (T2 vs T0): {pehe_results[1]:.4f}")
     print(f"PEHE (T3 vs T0): {pehe_results[2]:.4f}")
 
+    if not args.dry_run:
+        np.savez(f"{args.output_dir}/cate_results.npz",
+                est_cate=eval_results['est_cate'],
+                true_cate=eval_results['true_cate'],
+                pehe=eval_results['pehe'],
+                X_test=X_test)
+        print(f"CATE results and PEHE saved in {args.output_dir}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run Causal Inference Model Experiments")
     parser.add_argument('--scenario', type=str, default='education', choices=['education', 'medication'])
-    # Add the new model type as a choice
-    parser.add_argument('--model_type', type=str, default='mcfrnet', choices=['mcfrnet', 'structured_mcfr', 'hierarchical_mcfr'])
+    parser.add_argument('--model_type', type=str, default='mcfrnet', 
+                        choices=['mcfrnet', 'structured_mcfr', 'hierarchical_mcfr', 'causal_forest'])
+    parser.add_argument('--output_dir', type=str, required=True, help='Directory to save results.')
+    parser.add_argument('--dry_run', action='store_true', help='If true, script will not train or evaluate.')
     parser.add_argument('--n_samples', type=int, default=5000)
     parser.add_argument('--kappa', type=float, default=2.0)
     parser.add_argument('--seed', type=int, default=42)
